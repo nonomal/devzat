@@ -3,32 +3,35 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/acarl005/stripansi"
-
+	"github.com/quackduck/term"
 	"github.com/slack-go/slack"
 )
 
 var (
-	slackChan      = getSendToSlackChan()
-	slackChannelID = "C01T5J557AA" // todo: generalize
-	api            *slack.Client
-	rtm            *slack.RTM
+	SlackChan  chan string
+	SlackAPI   *slack.Client
+	SlackRTM   *slack.RTM
+	SlackBotID string
 )
 
 func getMsgsFromSlack() {
-	if offlineSlack {
+	if Integrations.Slack == nil {
 		return
 	}
 
-	go rtm.ManageConnection()
-	uslack := new(user)
-	uslack.room = mainRoom
-	for msg := range rtm.IncomingEvents {
+	go SlackRTM.ManageConnection()
+
+	uslack := new(User)
+	uslack.isBridge = true
+	devnull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	uslack.term = term.NewTerminal(devnull, "")
+	uslack.room = MainRoom
+	for msg := range SlackRTM.IncomingEvents {
 		switch ev := msg.Data.(type) {
 		case *slack.MessageEvent:
 			msg := ev.Msg
@@ -36,53 +39,44 @@ func getMsgsFromSlack() {
 			if msg.SubType != "" {
 				break // We're only handling normal messages.
 			}
-			u, _ := api.GetUserInfo(msg.User)
-			if !strings.HasPrefix(text, "./hide") {
-				h := sha1.Sum([]byte(u.ID))
-				i, _ := strconv.ParseInt(hex.EncodeToString(h[:2]), 16, 0) // two bytes as an int
-				uslack.name = yellow.Paint("HC ") + (styles[int(i)%len(styles)]).apply(strings.Fields(u.RealName)[0])
-				uslack.isSlack = true
-				runCommands(text, uslack)
+			u, _ := SlackAPI.GetUserInfo(msg.User)
+			if u == nil || u.ID == SlackBotID {
+				break
 			}
+			h := sha1.Sum([]byte(u.ID))
+			i, _ := strconv.ParseInt(hex.EncodeToString(h[:2]), 16, 0) // two bytes as an int
+			name := strings.Fields(u.RealName)[0]
+			uslack.Name = Yellow.Paint(Integrations.Slack.Prefix+" ") + (Styles[int(i)%len(Styles)]).apply(name)
+			if Integrations.Discord != nil {
+				DiscordChan <- DiscordMsg{
+					senderName: Integrations.Slack.Prefix + " " + name,
+					msg:        text,
+					channel:    uslack.room.name,
+				} // send this discord message to slack
+			}
+			runCommands(text, uslack)
 		case *slack.ConnectedEvent:
-			l.Println("Connected to Slack")
+			SlackBotID = ev.Info.User.ID
+			Log.Println("Connected to Slack with bot ID", SlackBotID, "as", ev.Info.User.Name)
 		case *slack.InvalidAuthEvent:
-			l.Println("Invalid token")
+			Log.Println("Invalid Slack authentication")
 			return
 		}
 	}
 }
 
-func getSendToSlackChan() chan string {
-	slackAPI, err := ioutil.ReadFile("slackAPI.txt")
-
-	if os.IsNotExist(err) {
-		offlineSlack = true
-		l.Println("Did not find slackAPI.txt. Enabling offline mode.")
-	} else if err != nil {
-		panic(err)
+func slackInit() { // called by init() in config.go
+	if Integrations.Slack == nil {
+		return
 	}
 
-	if offlineSlack {
-		msgs := make(chan string, 2)
-		go func() {
-			for range msgs {
-			}
-		}()
-		return msgs
-	}
-
-	api = slack.New(string(slackAPI))
-	rtm = api.NewRTM()
-	msgs := make(chan string, 100)
+	SlackAPI = slack.New(Integrations.Slack.Token)
+	SlackRTM = SlackAPI.NewRTM()
+	SlackChan = make(chan string, 100)
 	go func() {
-		for msg := range msgs {
+		for msg := range SlackChan {
 			msg = strings.ReplaceAll(stripansi.Strip(msg), `\n`, "\n")
-			//if strings.HasPrefix(msg, "sshchat: ") { // just in case
-			//	continue
-			//}
-			rtm.SendMessage(rtm.NewOutgoingMessage(msg, slackChannelID))
+			SlackRTM.SendMessage(SlackRTM.NewOutgoingMessage(msg, Integrations.Slack.ChannelID))
 		}
 	}()
-	return msgs
 }
